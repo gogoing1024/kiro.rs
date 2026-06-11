@@ -42,12 +42,84 @@
             flex-wrap: wrap;
         }
         .format-select {
-            padding: 8px 16px;
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            opacity: 0;
+            pointer-events: none;
+        }
+        .format-dropdown {
+            position: relative;
+            min-width: 150px;
+        }
+        .format-trigger {
+            display: inline-flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            width: 100%;
+            height: 40px;
+            padding: 0 14px;
             border: 1px solid #30363d;
-            border-radius: 6px;
-            background: #21262d;
+            border-radius: 999px;
+            background: rgba(33, 38, 45, 0.78);
             color: #c9d1d9;
+            cursor: pointer;
             font-size: 14px;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+        .format-trigger:hover {
+            border-color: #58a6ff;
+            background: rgba(48, 54, 61, 0.9);
+        }
+        .format-trigger::after {
+            content: "";
+            width: 7px;
+            height: 7px;
+            border-right: 2px solid #8b949e;
+            border-bottom: 2px solid #8b949e;
+            transform: translateY(-2px) rotate(45deg);
+        }
+        .format-menu {
+            position: absolute;
+            top: calc(100% + 6px);
+            left: 0;
+            z-index: 20;
+            display: none;
+            width: 100%;
+            padding: 6px;
+            border: 1px solid rgba(88, 166, 255, 0.22);
+            border-radius: 16px;
+            background: rgba(22, 27, 34, 0.96);
+            box-shadow: 0 18px 45px rgba(0, 0, 0, 0.35);
+            backdrop-filter: blur(14px);
+        }
+        .format-dropdown.open .format-menu {
+            display: block;
+        }
+        .format-option {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            width: 100%;
+            padding: 8px 10px;
+            border: 0;
+            border-radius: 10px;
+            background: transparent;
+            color: #c9d1d9;
+            cursor: pointer;
+            font-size: 14px;
+            text-align: left;
+        }
+        .format-option:hover {
+            background: rgba(88, 166, 255, 0.14);
+            color: #ffffff;
+        }
+        .format-option.active::after {
+            content: "✓";
+            color: #58a6ff;
+            font-weight: 700;
         }
         textarea {
             width: 100%;
@@ -328,6 +400,78 @@
             font-size: 12px;
             margin-left: 8px;
         }
+        .app-dialog-overlay {
+            position: fixed;
+            inset: 0;
+            z-index: 1000;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 16px;
+            background: rgba(0, 0, 0, 0.42);
+            backdrop-filter: blur(10px);
+        }
+        .app-dialog-overlay.open {
+            display: flex;
+        }
+        .app-dialog {
+            position: relative;
+            width: min(100%, 420px);
+            padding: 28px 32px 24px;
+            border: 1px solid rgba(201, 209, 217, 0.16);
+            border-radius: 28px;
+            background: #f8f9fb;
+            color: #1f2328;
+            box-shadow: 0 24px 70px rgba(0, 0, 0, 0.35);
+        }
+        .app-dialog-close {
+            position: absolute;
+            top: 18px;
+            right: 18px;
+            width: 40px;
+            height: 40px;
+            border: 0;
+            border-radius: 999px;
+            background: #eef0f3;
+            color: #6e7781;
+            cursor: pointer;
+            font-size: 28px;
+            line-height: 1;
+        }
+        .app-dialog-title {
+            padding-right: 48px;
+            font-size: 26px;
+            font-weight: 700;
+            line-height: 1.25;
+        }
+        .app-dialog-message {
+            margin-top: 10px;
+            color: #6e7781;
+            font-size: 17px;
+            line-height: 1.6;
+        }
+        .app-dialog-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 14px;
+            margin-top: 28px;
+        }
+        .app-dialog-button {
+            min-width: 104px;
+            height: 46px;
+            border: 1px solid #d0d7de;
+            border-radius: 999px;
+            background: #ffffff;
+            color: #1f2328;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 700;
+        }
+        .app-dialog-button.primary {
+            border-color: #0969da;
+            background: #0969da;
+            color: #ffffff;
+        }
     </style>
 </head>
 <body>
@@ -342,6 +486,14 @@
                     <option value="hex">Hex</option>
                     <option value="base64">Base64</option>
                 </select>
+                <div class="format-dropdown" id="formatDropdown">
+                    <button class="format-trigger" id="formatTrigger" type="button" onclick="toggleFormatDropdown()">自动检测</button>
+                    <div class="format-menu" id="formatMenu">
+                        <button class="format-option active" type="button" data-value="auto" onclick="setInputFormat('auto')">自动检测</button>
+                        <button class="format-option" type="button" data-value="hex" onclick="setInputFormat('hex')">Hex</button>
+                        <button class="format-option" type="button" data-value="base64" onclick="setInputFormat('base64')">Base64</button>
+                    </div>
+                </div>
                 <button class="btn btn-primary" onclick="parseInput()">解析</button>
                 <button class="btn btn-secondary" onclick="clearAll()">清空</button>
                 <button class="btn btn-secondary" onclick="loadExample()">加载示例</button>
@@ -359,6 +511,17 @@
         <div class="raw-section" id="rawSection" style="display: none;">
             <h3>原始字节数据 <button class="btn btn-secondary copy-btn" onclick="copyRawHex()">复制 Hex</button></h3>
             <div class="payload-hex" id="rawHex"></div>
+        </div>
+    </div>
+
+    <div class="app-dialog-overlay" id="appDialogOverlay" role="dialog" aria-modal="true" aria-labelledby="appDialogTitle" aria-describedby="appDialogMessage">
+        <div class="app-dialog">
+            <button class="app-dialog-close" type="button" onclick="hideAppDialog()" aria-label="关闭">×</button>
+            <div class="app-dialog-title" id="appDialogTitle"></div>
+            <div class="app-dialog-message" id="appDialogMessage"></div>
+            <div class="app-dialog-actions">
+                <button class="app-dialog-button primary" type="button" onclick="hideAppDialog()">确定</button>
+            </div>
         </div>
     </div>
 
@@ -865,11 +1028,46 @@
             parsedData = null;
         }
 
+        function showAppDialog(title, message) {
+            document.getElementById('appDialogTitle').textContent = title;
+            document.getElementById('appDialogMessage').textContent = message;
+            document.getElementById('appDialogOverlay').classList.add('open');
+        }
+
+        function hideAppDialog() {
+            document.getElementById('appDialogOverlay').classList.remove('open');
+        }
+
+        function toggleFormatDropdown() {
+            document.getElementById('formatDropdown').classList.toggle('open');
+        }
+
+        function setInputFormat(value) {
+            const select = document.getElementById('inputFormat');
+            const trigger = document.getElementById('formatTrigger');
+            const options = document.querySelectorAll('.format-option');
+
+            select.value = value;
+            options.forEach((option) => {
+                const active = option.dataset.value === value;
+                option.classList.toggle('active', active);
+                if (active) trigger.textContent = option.textContent;
+            });
+            document.getElementById('formatDropdown').classList.remove('open');
+        }
+
+        document.addEventListener('click', (event) => {
+            const dropdown = document.getElementById('formatDropdown');
+            if (!dropdown.contains(event.target)) dropdown.classList.remove('open');
+        });
+
         function copyRawHex() {
             if (!parsedData) return;
             const hex = Array.from(parsedData).map(b => b.toString(16).padStart(2, '0')).join(' ');
             navigator.clipboard.writeText(hex).then(() => {
-                alert('已复制到剪贴板');
+                showAppDialog('已复制', 'Hex 数据已复制到剪贴板。');
+            }).catch(() => {
+                showAppDialog('复制失败', '请检查浏览器剪贴板权限，或手动选择内容复制。');
             });
         }
 
