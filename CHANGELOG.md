@@ -4,6 +4,86 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.10] - 2026-07-10
+
+主题：**放宽 Admin API 请求体上限，修复批量导入凭据时大 JSON 被拒的 413 问题**。批量导入会一次性提交待导入凭据，包含 `refreshToken`、`clientSecret` 等较长字段；当条目较多时，请求体容易超过 axum 默认 2MB 限制并返回 HTTP 413。本版将 Admin 路由请求体上限统一放宽到 50MB，与 Anthropic 路由保持一致，确保大批量导入请求能进入服务端有界并发处理流程。
+
+### 🔧 修复 — Admin 批量导入 413
+
+> 来源：[PR #34](https://github.com/ZyphrZero/kiro.rs/pull/34)。提交人：[@l-spaces](https://github.com/l-spaces)（哈哈先生），感谢贡献。
+
+- **Admin 路由请求体上限提升至 50MB**：为 Admin router 增加 `DefaultBodyLimit::max(50 * 1024 * 1024)`，覆盖 `POST /credentials/batch-import` 等 Admin API，避免批量导入凭据时因默认 2MB body limit 被 axum 提前拒绝。
+- **保持批量导入处理链路不变**：前端仍一次性 POST 待导入条目，服务端继续按既有并发度处理并通过 SSE 回传逐条结果；本次只调整网关层请求体限制，不改变导入、验活、去重或回滚语义。
+
+## [0.6.9] - 2026-07-06
+
+主题：**Tool Call 全链路加固、tool inputSchema 规范化、CCH 缓存计量与 Thinking effort 修复、凭据持久化原子落盘，并回退 v0.6.7 的远程部署 Social 登录**。本版汇总 0.6.8 以来累积的多项 Rust 侧健壮性加固与一处回退：工具调用改为按 `tool_use_id` 缓冲后整体解析并显式暴露非法 JSON、Claude Code 内置工具名双向映射与 `<tool_use>` XML 泄漏过滤；规范化 MCP 工具 schema 以规避 Bedrock `TOOL_SCHEMA_INVALID` 400；修正主 Key 缓存计量口径并放宽原生 Thinking effort 下发范围；凭据回写改为 tmp+rename 原子落盘并锁定整个「快照 + 写盘」临界区（issue #23）；同时因 Kiro 收紧 OAuth 回调白名单，回退 v0.6.7 的远程部署 Social 登录（`redirect_uri` 恢复为本机 `127.0.0.1`，远程访问保留手动粘贴兜底）。多数改动参考 `Kiro-RS-Tool` 定位并移植 / 优化。
+
+### ✨ 增强 — Tool Call 全链路加固
+
+> 参考 [GreyGunG/Kiro-RS-Tool](https://github.com/GreyGunG/Kiro-RS-Tool) 定位并移植 / 优化其 `ToolJsonAccumulator`、统一工具调用管道等基础设施。
+
+- **分片缓冲后整体解析**：新增 `ToolJsonAccumulator`，按 `tool_use_id` 缓冲工具入参分片，`stop` 时整体解析；半截 / 非法 JSON 显式暴露（非流式 / CCH 回 502，实时流补发 `error` 事件），不再把半截 JSON 当完整工具调用转发；非流式移除静默回退 `{}` 与截断静默丢弃。
+- **Claude Code 内置工具双向兼容**：`toolCompatibilityMode`（默认 `claude-code`，`raw` 供排障）下对内置工具名与入参双向映射（`Write`↔`fs_write` 等）、替换内置 schema、隐藏 `fs_append`；入站还原以 Kiro 工具名匹配实现自动门控，`raw` 模式不误伤客户端同名工具。
+- **统一工具调用管道**：收敛到 `CompletedToolUse`（`from_kiro` 唯一还原、`emit_completed_tool_use` 唯一流式发出、`to_anthropic_block` 唯一非流式块），删除重复的 `synthesize_tool_use`。
+- **过滤 `<tool_use>` XML 泄漏**：`strip_tool_use_xml_leaks` + 跨 chunk `ToolUseXmlLeakFilter`（修复闭合标签跨 chunk 的场景）。
+
+### 🔧 修复 — tool inputSchema 规范化（规避 Bedrock `TOOL_SCHEMA_INVALID` 400）
+
+> 参考 [GreyGunG/Kiro-RS-Tool PR #6](https://github.com/GreyGunG/Kiro-RS-Tool/pull/6)。部分 MCP 工具（尤其 Claude Code workflow 并行子代理携带的）会因 schema 触发 Bedrock 400。
+
+- **顶层 `type` 强制 `object`**：`normalize_json_schema` 原先仅在 `type` 缺失 / 为空时补 `object`，`type:"array"` 等会漏过；现一律强制为 `object`（非 object 时告警并修正）。
+- **剥离顶层组合关键字**：新增 `strip_top_level_combinators`，剥离顶层 `oneOf` / `anyOf` / `allOf`（Bedrock / Anthropic 不支持顶层组合关键字）；原 schema 无 `properties` 时，从首个 `type:object` 的 variant 恢复 `properties` / `required` / `additionalProperties` / `description`，避免退化成空对象。
+- **命中即终止**：`CLIENT_VALIDATION_REASONS` 新增 `TOOL_SCHEMA_INVALID`——根因在请求体，重试 / 换号无用，命中即立即终止。
+
+### 🔧 修复 — CCH 缓存计量
+
+- **主 Key 不再模拟跨用户缓存**：`isolation_seed` 改为 `Option`，主 Key（`id=0`）无 session 时不再模拟跨用户缓存。
+- **分母口径修正**：被跳过的动态 system 前缀计入 `prompt_total` 分母。
+
+### 🔧 修复 — Thinking effort 下发范围
+
+- **放宽原生 effort**：原生 `effort` 下发扩展至 Opus 4.6 / 4.7 / 4.8 + Sonnet 4.6 + 5 系。
+- **从预算推导**：支持从 `thinking.budget_tokens` 推导 `effort`。
+
+### 🔐 修复 — 凭据持久化原子落盘（issue #23）
+
+- **锁定整个临界区**：`persist_lock` 覆盖「快照 + 序列化 + 写盘」整个临界区，最后写盘者必在临界区内重新快照到最新内存，杜绝陈旧快照覆盖已轮换的 token；`entries.lock` 仅在快照期短暂持有、不跨磁盘 I/O，故不阻塞请求路由。
+- **tmp+rename 原子落盘**：先写临时文件再同目录 `rename`（原子操作），失败时清理临时文件，避免崩溃 / 并发导致半截凭据文件。
+
+### ⏪ 回退 — 远程部署 Social 登录（撤销 Issue #20）
+
+- **移除公网回调路由**：删除免鉴权 `GET /api/admin/auth/callback/{*tail}` 及其回调投递逻辑（`social_oauth_callback` / `deliver_remote_social_callback` / `RemoteCallbackOutcome`）。
+- **移除回调地址派生**：删除 `config.callbackBaseUrl` 配置项与前端 `deriveCallbackBaseUrl`（按 `location.origin` 自动派生），`start_social_login` / `start_social_relogin` 恢复为始终启动本机临时 TCP 回调端口，`redirect_uri` 固定为 `http://127.0.0.1:{port}`。
+- **移除 `remote` 响应字段**：`StartSocialLoginResponse` 不再返回 `remote`；前端登录 / 重新登录对话框回到「本地访问自动轮询、远程访问手动粘贴」两态。
+- **保留手动完成兜底**：`POST /auth/social/complete/{sessionId}`（及重新登录版本）保留不变——远程访问用户仍可从浏览器地址栏复制 localhost 失败页的完整 URL 粘贴完成登录。
+
+## [0.6.8] - 2026-07-06
+
+主题：**新增 Claude Sonnet 5 / Claude Fable 5 模型映射 + 企业 SSO（Microsoft Entra ID / Azure AD）`external_idp` 认证**。这一版把请求模型关键词映射扩展到 5 代 Sonnet / Fable，并让 `/v1/models` 能列出它们；同时新增第四种认证方式 `external_idp`，支持以 JSON 导入 Microsoft Entra ID / Azure AD 企业租户账号（既不是 AWS Builder ID 也不是 IAM Identity Center，原先无法接入），Token 走 IdP 的 OAuth2 `refresh_token` grant 刷新，并在导入与刷新两处对 IdP 端点做 allow-list 校验，防止 refresh token 外泄。
+
+### ✨ 新功能 — 新增模型映射：Claude Sonnet 5 / Claude Fable 5
+
+- **`claude-sonnet-5`**：`map_model` 的 sonnet 分支新增主版本 5，精确匹配 `sonnet-5` / `sonnet5` / `sonnet.5`（含 `-5-20xxx`、`-5-thinking` 等后缀），排在 4.x 判断之前/相邻并精确到 `sonnet-5`，避免把 `4-5` / `4.5` 误判为 5，也不会命中 legacy 的 `claude-3-5-sonnet`。
+- **`claude-fable-5`**：新增独立 `fable` 分支，映射到上游 `claude-fable-5`（Fable 5 与 Mythos 5 同底座，目前仅 5 代），放在最前以免干扰其它关键词。
+- **上下文窗口**：`claude-sonnet-5` 与 `claude-fable-5` 均按 `1_000_000` 上下文处理。
+- **`/v1/models` 静态列表**：新增 `claude-sonnet-5` / `claude-sonnet-5-thinking`、`claude-fable-5` / `claude-fable-5-thinking` 四个条目，客户端可直接发现。
+- **effort 分级**：两者默认支持 `xhigh`（`fable-5` 显式在允许列表，`sonnet-5` 不在旧模型黑名单），无需额外配置。
+
+### ✨ 新功能 — 企业 SSO（Microsoft Entra ID / Azure AD）`external_idp` 认证
+
+> 核心逻辑参考 [Quorinex/Kiro-Go#131](https://github.com/Quorinex/Kiro-Go/pull/131) 移植。本版仅实现凭据导入与刷新，**不含**浏览器门户登录 / 回调监听 / 两段式状态机——按需手动获取 Azure 凭据后以 JSON 导入即可。
+
+- **新增第四种认证方式 `external_idp`**：适用于 Microsoft 365 / Entra ID / Azure AD 企业租户账号。凭据新增三个字段：`tokenEndpoint`（IdP 的 OAuth2 token 端点）、`issuerUrl`（OIDC issuer，纯备注）、`scopes`（空格分隔的已授权 scope，需含 `offline_access` 才能拿到 refresh token）。`authMethod` 可写 `external_idp`，也接受 `azuread` / `azure` / `entra` / `entra-id` / `microsoft` / `m365` / `office365` / `external` 等别名统一归一化；未声明 `authMethod` 但带 `tokenEndpoint` 时自动推断为 `external_idp`。
+- **IdP token 端点刷新**：`external_idp` 账号的刷新走 IdP OAuth2 `refresh_token` grant（公共客户端，`application/x-www-form-urlencoded` 表单，无 `clientSecret`），区别于 Social / IdC 的刷新路径。IdP 未下发新 refresh token 时保留原值（Azure AD 有时不轮换）；`invalid_grant` 复用既有的永久失效检测，自动禁用凭据。IdP 不返回 `profileArn`，真实 ARN 仍由 `ListAvailableProfiles` 懒解析回填（与 IdC 一致）。
+- **`TokenType: EXTERNAL_IDP` 头**：数据面（`generateAssistantResponse` / MCP）与 `getUsageLimits` / `ListAvailableProfiles` / `setUserPreference` 等 REST 请求，对 `external_idp` 账号自动携带该头——否则 CodeWhisperer 静默返回空 profile 列表并拒绝数据面调用。
+- **Admin 导入 / 导出**：`AddCredentialRequest` 与账号导出结构均新增 `tokenEndpoint` / `issuerUrl` / `scopes`；「添加凭据」对话框新增「企业 SSO (Microsoft Entra / Azure AD)」选项与对应输入（Client ID / Token Endpoint / Issuer URL / Scopes），批量导入与嵌套账号（KAM 格式）导入均支持 `external_idp`；凭据卡片展示 `Entra ID` / `企业 SSO` 标签。导出会无损保留新字段与 `external_idp` 认证方式。
+
+### 🔐 安全 — 外部 IdP 端点 allow-list 校验
+
+- **防 SSRF / refresh token 外泄**：`tokenEndpoint` 是外发 refresh token 的目标，属新的信任边界。导入 `external_idp` 凭据时，以及**每次刷新外发前**，都会校验 `tokenEndpoint`（及 `issuerUrl`，若提供）：必须为 `https`、host 非 IP 字面量、且命中允许列表后缀（`*.microsoftonline.com` / `.us` / `.cn`，前导点锚定到真实子域边界）。校验不通过的凭据直接拒绝导入，不会把 refresh token 发往非法主机。新增 IdP 时可扩展该允许列表。
+- **必填校验**：导入 `external_idp` 时若缺少 `clientId` 或 `tokenEndpoint`（刷新的前提），提前返回明确错误而非等到刷新失败。
+
 ## [0.6.7] - 2026-06-17
 
 主题：**远程部署 Social 登录零配置化（OAuth 回调地址自动派生）+ 凭据列表卡片 / 列表双视图与分页增强 + 来源渠道模糊搜索与移动端体验优化 + output_config.effort 分级归一化**。这一版解决了远程部署（Render / Docker / VPS）下 Social 登录回调指向 `127.0.0.1` 无法使用的痛点——前端按当前访问地址自动派生公网回调地址，远程部署零配置即可完成 Google / GitHub 登录；凭据列表新增 iOS 风格的卡片 / 列表双视图切换、可配置每页数量与跨页全选；同时归一化 `output_config.effort` 分级，避免较老模型收到不支持的 `xhigh` 报错，并在删除凭据时清理其历史失败记录。凭据管理页面还新增按来源渠道（备注）/ 邮箱的模糊搜索、批量导入 / 验活 / 刷新余额的 8 路并发化，以及一轮移动端工具栏布局与下拉菜单渲染异常的修复。
